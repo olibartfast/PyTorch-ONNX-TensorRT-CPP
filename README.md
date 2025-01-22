@@ -12,5 +12,5 @@ cmake --build  .
 ./resnet50-trt path_to_onnx_model/resnet50.onnx path_to_image/turkish_coffee.jpg path_to_classes_names/imagenet_classes.txt 
 ```
 ### References
-https://docs.nvidia.com/deeplearning/tensorrt/migration-guide/index.html
-https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#c_topics
+* https://docs.nvidia.com/deeplearning/tensorrt/migration-guide/index.html
+* https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#c_topics

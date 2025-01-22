@@ -1,6 +1,6 @@
 # How To Run Inference Using TensorRT C++ API
 
-This example is the version implemented in [learnopencv repo](https://github.com/spmallick/learnopencv/tree/8fa15839b9283cff060284d0f549b0f083afaf90/PyTorch-ONNX-TensorRT-CPP)  modified with support to tensorrt 8 and opencv built without contrib(and so cuda) module
+This example is the version implemented in [learnopencv repo](https://github.com/spmallick/learnopencv/tree/8fa15839b9283cff060284d0f549b0f083afaf90/PyTorch-ONNX-TensorRT-CPP)  modified with support to tensorrt 10.x and opencv built without contrib(and so cuda) module
 
 ## Build, compile and run
 

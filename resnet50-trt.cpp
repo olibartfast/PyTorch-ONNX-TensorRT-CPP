@@ -217,9 +217,11 @@ int main(int argc, char* argv[]) {
     std::vector<nvinfer1::Dims> input_dims; // We expect only one input
     std::vector<nvinfer1::Dims> output_dims; // And one output
     std::vector<void*> buffers(engine->getNbIOTensors()); // Buffers for input and output data
-
+    std::vector<std::string> layer_names;
     for (size_t i = 0; i < engine->getNbIOTensors(); ++i) {
         const auto bindingName = engine->getIOTensorName(i);
+        std::cout <<"Name " << bindingName << std::endl;
+        layer_names.emplace_back(bindingName);
         const auto binding_size = getSizeByDim(engine->getTensorShape(bindingName)) * sizeof(float);
         cudaMalloc(&buffers[i], binding_size);
         if (engine->getTensorIOMode(bindingName) == TensorIOMode::kINPUT) {
@@ -243,13 +245,13 @@ int main(int argc, char* argv[]) {
     cudaStreamCreate(&stream);
 
     // Set the input tensor address
-    if (!context->setInputTensorAddress("input", buffers[0])) { // Assuming "input" is the name of your input tensor
+    if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) { // Assuming "input" is the name of your input tensor
         std::cerr << "Failed to set input tensor address." << std::endl;
         return -1;
     }
 
     // Set the output tensor address
-    if (!context->setOutputTensorAddress("output", buffers[1])) { // Assuming "output" is the name of your output tensor
+    if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) { // Assuming "output" is the name of your output tensor
         std::cerr << "Failed to set output tensor address." << std::endl;
         return -1;
     }

@@ -13,3 +13,4 @@ cmake --build  .
 ```
 ### References
 https://docs.nvidia.com/deeplearning/tensorrt/migration-guide/index.html
+https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#c_topics

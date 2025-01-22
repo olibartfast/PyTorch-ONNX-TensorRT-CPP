@@ -21,6 +21,70 @@ using namespace nvinfer1;
         } \
     } while (0)
 
+
+// CUDA error checking macro
+#define CHECK_CUDA(status) \
+    do { \
+        auto ret = (status); \
+        if (ret != cudaSuccess) { \
+            std::cerr << "CUDA error: " << cudaGetErrorString(ret) << std::endl; \
+            throw std::runtime_error("CUDA error"); \
+        } \
+    } while (0)
+
+// Added: CUDA initialization check
+bool initializeCUDA() {
+    int device_count;
+    CHECK_CUDA(cudaGetDeviceCount(&device_count));
+    
+    if (device_count == 0) {
+        std::cerr << "No CUDA devices found!" << std::endl;
+        return false;
+    }
+
+    // Print device information
+    for (int dev = 0; dev < device_count; ++dev) {
+        cudaDeviceProp prop;
+        CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
+        std::cout << "Found CUDA device " << dev << ": " << prop.name 
+                  << " (Compute capability: " << prop.major << "." << prop.minor << ")" << std::endl;
+    }
+
+    // Set to use first device
+    CHECK_CUDA(cudaSetDevice(0));
+    return true;
+}
+
+// Timer class using CUDA events
+class CudaTimer {
+public:
+    CudaTimer() {
+        CHECK_CUDA(cudaEventCreate(&start_));
+        CHECK_CUDA(cudaEventCreate(&stop_));
+    }
+
+    ~CudaTimer() {
+        CHECK_CUDA(cudaEventDestroy(start_));
+        CHECK_CUDA(cudaEventDestroy(stop_));
+    }
+
+    void start() {
+        CHECK_CUDA(cudaEventRecord(start_));
+    }
+
+    float stop() {
+        CHECK_CUDA(cudaEventRecord(stop_));
+        CHECK_CUDA(cudaEventSynchronize(stop_));
+        float milliseconds = 0;
+        CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start_, stop_));
+        return milliseconds;
+    }
+
+private:
+    cudaEvent_t start_;
+    cudaEvent_t stop_;
+};
+
 // utilities ----------------------------------------------------------------------------------------------------------
 // Class to log errors, warnings, and other information during the build and inference phases
 class Logger : public nvinfer1::ILogger
@@ -206,33 +270,29 @@ void postprocessResults(float* gpu_output, const nvinfer1::Dims& dims, const std
 
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << "usage: " << argv[0] << " ./resnet50-trt  path_to_onnx_model/resnet50.onnx path_to_image/turkish_coffee.jpg path_to_classes_names/imagenet_classes.txt \n";
+        std::cerr << "usage: " << argv[0] << " ./resnet50-trt path_to_onnx_model/resnet50.onnx path_to_image/turkish_coffee.jpg path_to_classes_names/imagenet_classes.txt \n";
         return -1;
     }
     const std::string model_path(argv[1]);
     const std::string image_path(argv[2]);
     const std::string path_to_classes_names(argv[3]);
 
-    std::cout << model_path << std::endl;
-    std::cout << image_path << std::endl;
-    std::cout << path_to_classes_names << std::endl;
-
     // Initialize TensorRT engine and parse ONNX model
     TRTUniquePtr<nvinfer1::ICudaEngine> engine;
     TRTUniquePtr<nvinfer1::IExecutionContext> context;
     parseOnnxModel(model_path, engine, context);
 
-    // Get sizes of input and output and allocate memory required for input data and for output data
-    std::vector<nvinfer1::Dims> input_dims; // We expect only one input
-    std::vector<nvinfer1::Dims> output_dims; // And one output
-    std::vector<void*> buffers(engine->getNbIOTensors()); // Buffers for input and output data
+    // Get sizes of input and output and allocate memory
+    std::vector<nvinfer1::Dims> input_dims;
+    std::vector<nvinfer1::Dims> output_dims;
+    std::vector<void*> buffers(engine->getNbIOTensors());
     std::vector<std::string> layer_names;
+    
     for (size_t i = 0; i < engine->getNbIOTensors(); ++i) {
         const auto bindingName = engine->getIOTensorName(i);
-        std::cout <<"Name " << bindingName << std::endl;
         layer_names.emplace_back(bindingName);
         const auto binding_size = getSizeByDim(engine->getTensorShape(bindingName)) * sizeof(float);
-        cudaMalloc(&buffers[i], binding_size);
+        CHECK_CUDA(cudaMalloc(&buffers[i], binding_size));
         if (engine->getTensorIOMode(bindingName) == TensorIOMode::kINPUT) {
             input_dims.emplace_back(engine->getTensorShape(bindingName));
         } else {
@@ -245,38 +305,47 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Preprocess input data
-    preprocessImage(image_path, (float*)buffers[0], input_dims[0]);
-
-    // Inference
-    std::cout << "Inference" << std::endl;
+    // Create CUDA stream and timer
     cudaStream_t stream;
-    // Added: CUDA error checking
     CHECK_CUDA(cudaStreamCreate(&stream));
+    CudaTimer timer;
 
+    // Time preprocessing
+    timer.start();
+    preprocessImage(image_path, (float*)buffers[0], input_dims[0]);
+    float preprocess_time = timer.stop();
+    std::cout << "Preprocessing time: " << preprocess_time << " ms" << std::endl;
+
+    // Time inference
     if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) {
         throw std::runtime_error("Failed to set input tensor address");
     }
-
     if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) {
         throw std::runtime_error("Failed to set output tensor address");
     }
 
+    timer.start();
     if (!context->enqueueV3(stream)) {
         throw std::runtime_error("Failed to enqueue inference");
     }
-
     CHECK_CUDA(cudaStreamSynchronize(stream));
+    float inference_time = timer.stop();
+    std::cout << "Inference time: " << inference_time << " ms" << std::endl;
 
+    // Time postprocessing
+    timer.start();
     postprocessResults(static_cast<float*>(buffers[1]), output_dims[0], path_to_classes_names);
+    float postprocess_time = timer.stop();
+    std::cout << "Postprocessing time: " << postprocess_time << " ms" << std::endl;
 
-    // Added: Proper cleanup
+    // Print total time
+    std::cout << "Total time: " << (preprocess_time + inference_time + postprocess_time) << " ms" << std::endl;
+
+    // Cleanup
     CHECK_CUDA(cudaStreamDestroy(stream));
     for (void* buf : buffers) {
         CHECK_CUDA(cudaFree(buf));
     }
-
-    std::cout << "Finished" << std::endl;
 
     return 0;
 }

@@ -11,6 +11,15 @@
 
 using namespace nvinfer1;
 
+// Added: CUDA error checking macro
+#define CHECK_CUDA(status) \
+    do { \
+        auto ret = (status); \
+        if (ret != cudaSuccess) { \
+            std::cerr << "CUDA error: " << cudaGetErrorString(ret) << std::endl; \
+            throw std::runtime_error("CUDA error"); \
+        } \
+    } while (0)
 
 // utilities ----------------------------------------------------------------------------------------------------------
 // Class to log errors, warnings, and other information during the build and inference phases
@@ -242,32 +251,29 @@ int main(int argc, char* argv[]) {
     // Inference
     std::cout << "Inference" << std::endl;
     cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    // Added: CUDA error checking
+    CHECK_CUDA(cudaStreamCreate(&stream));
 
-    // Set the input tensor address
-    if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) { // Assuming "input" is the name of your input tensor
-        std::cerr << "Failed to set input tensor address." << std::endl;
-        return -1;
+    if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) {
+        throw std::runtime_error("Failed to set input tensor address");
     }
 
-    // Set the output tensor address
-    if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) { // Assuming "output" is the name of your output tensor
-        std::cerr << "Failed to set output tensor address." << std::endl;
-        return -1;
+    if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) {
+        throw std::runtime_error("Failed to set output tensor address");
     }
 
-    if (context->enqueueV3(stream)) {
-        std::cout << "Forward success !" << std::endl;
-    } else {
-        std::cout << "Forward Error !" << std::endl;
+    if (!context->enqueueV3(stream)) {
+        throw std::runtime_error("Failed to enqueue inference");
     }
 
-    // Postprocess results
-    std::cout << "Postprocess" << std::endl;
-    postprocessResults((float*)buffers[1], output_dims[0], path_to_classes_names);
+    CHECK_CUDA(cudaStreamSynchronize(stream));
 
+    postprocessResults(static_cast<float*>(buffers[1]), output_dims[0], path_to_classes_names);
+
+    // Added: Proper cleanup
+    CHECK_CUDA(cudaStreamDestroy(stream));
     for (void* buf : buffers) {
-        cudaFree(buf);
+        CHECK_CUDA(cudaFree(buf));
     }
 
     std::cout << "Finished" << std::endl;

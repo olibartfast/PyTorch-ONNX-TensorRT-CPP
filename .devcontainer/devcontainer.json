@@ -1,0 +1,31 @@
+{
+    "name": "TensorRT Development",
+    "image": "nvcr.io/nvidia/tensorrt:24.12-py3",
+    "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash"
+    },
+    "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "twxs.cmake",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools-extension-pack",
+        "franneck94.c-cpp-runner"
+    ],
+    "forwardPorts": [],
+    "portsAttributes": {
+        "3000": {
+            "label": "Application Port"
+        }
+    },
+    "postCreateCommand": "apt update && apt install libopencv-dev -y",
+    "runArgs": [
+        "--gpus", "all"
+    ],
+    "containerEnv": {
+        "NVIDIA_VISIBLE_DEVICES": "all"
+    },
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ]
+}

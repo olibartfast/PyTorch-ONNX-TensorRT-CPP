@@ -11,6 +11,44 @@
 
 using namespace nvinfer1;
 
+
+bool hasFastFp16(int deviceId) {
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceId);
+
+    // Check for compute capability
+    if (deviceProp.major < 6) {
+        return false; // Devices before compute capability 6.0 don't have fast FP16
+    }
+
+    // For Pascal (SM 6.0), only specific devices have fast FP16
+    if (deviceProp.major == 6 && deviceProp.minor == 0) {
+        return (deviceProp.name == "Tesla P100-PCIE-16GB" || deviceProp.name == "Tesla P100-SXM2-16GB");
+    }
+
+    // For CUDA 11.0 and later, check for TensorOpMath flag
+    #if CUDA_VERSION >= 11000
+        int hasTensorCores = 0;
+        cudaDeviceGetAttribute(&hasTensorCores, cudaDevAttrTensorOpMathFlags, deviceId);
+        if (hasTensorCores != 0) return true;
+    #endif
+
+    // For CUDA versions 7.5 to 10.2, check for global memory bus width and clock rate as an indicator of Tensor Cores
+    // This is a heuristic and may not be 100% accurate for all devices
+    if (deviceProp.major >= 7)
+    {
+        int globalMemoryBusWidth = 0;
+        cudaDeviceGetAttribute(&globalMemoryBusWidth, cudaDevAttrGlobalMemoryBusWidth, deviceId);
+        int clockRate = 0;
+        cudaDeviceGetAttribute(&clockRate, cudaDevAttrClockRate, deviceId);
+        if (globalMemoryBusWidth >= 256 && clockRate >= 1300000) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // utilities ----------------------------------------------------------------------------------------------------------
 // class to log errors, warnings, and other information during the build and inference phases
 class Logger : public nvinfer1::ILogger
@@ -24,28 +62,14 @@ public:
     }
 } gLogger;
 
-// destroy TensorRT objects if something goes wrong
-struct TRTDestroy
-{
-    template <class T>
-    void operator()(T* obj) const
-    {
-        if (obj)
-        {
-            obj->destroy();
-        }
-    }
-};
-
-template <class T>
-using TRTUniquePtr = std::unique_ptr<T, TRTDestroy>;
+template <typename T>
+using TRTUniquePtr = std::unique_ptr<T>;
 
 void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaEngine>& engine,
                      TRTUniquePtr<nvinfer1::IExecutionContext>& context)
 {
     TRTUniquePtr<nvinfer1::IBuilder> builder{nvinfer1::createInferBuilder(gLogger)};
-    const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-    TRTUniquePtr<nvinfer1::INetworkDefinition> network{builder->createNetworkV2(explicitBatch)};
+    TRTUniquePtr<nvinfer1::INetworkDefinition> network{builder->createNetworkV2(0U)};
     TRTUniquePtr<nvonnxparser::IParser> parser{nvonnxparser::createParser(*network, gLogger)};
     TRTUniquePtr<nvinfer1::IBuilderConfig> config{builder->createBuilderConfig()};
     // parse ONNX
@@ -56,12 +80,21 @@ void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaE
     }
     // allow TensorRT to use up to 1GB of GPU memory for tactic selection.
     auto MAX_WORKSPACE_SIZE = 1ULL << 30;
-    config->setMaxWorkspaceSize(MAX_WORKSPACE_SIZE);
+    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, MAX_WORKSPACE_SIZE);
     // use FP16 mode if possible
-    if (builder->platformHasFastFp16())
-    {
-        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+
+    for (int i = 0; i < deviceCount; ++i) {
+        if (hasFastFp16(i)) {
+            config->setFlag(BuilderFlag::kFP16);
+            std::cout << "Device " << i << " has fast FP16 support." << std::endl;
+        } else {
+            std::cout << "Device " << i << " does not have fast FP16 support." << std::endl;
+        }
     }
+
 
     // generate TensorRT engine optimized for the target platform
     engine.reset(builder->buildEngineWithConfig(*network, *config));
@@ -74,6 +107,7 @@ void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaE
         return;
     }
     p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
+    delete modelStream;
 }
 
 // calculate size of tensor
@@ -86,6 +120,7 @@ size_t getSizeByDim(const nvinfer1::Dims& dims)
     }
     return size;
 }
+
 
 // get classes names
 std::vector<std::string> getClassesNames(const std::string& imagenet_classes)
@@ -199,21 +234,22 @@ int main(int argc, char* argv[])
     TRTUniquePtr<nvinfer1::IExecutionContext> context{nullptr};
     parseOnnxModel(model_path, engine, context);
 
-        // get sizes of input and output and allocate memory required for input data and for output data
+    // get sizes of input and output and allocate memory required for input data and for output data
     std::vector<nvinfer1::Dims> input_dims; // we expect only one input
     std::vector<nvinfer1::Dims> output_dims; // and one output
-    std::vector<void*> buffers(engine->getNbBindings()); // buffers for input and output data
-     for (size_t i = 0; i < engine->getNbBindings(); ++i)
+    std::vector<void*> buffers(engine->getNbIOTensors()); // buffers for input and output data
+     for (size_t i = 0; i < engine->getNbIOTensors(); ++i)
     {
-        auto binding_size = getSizeByDim(engine->getBindingDimensions(i)) * sizeof(float);
+        auto const bindingName = engine->getIOTensorName(i);
+        auto binding_size = getSizeByDim(engine->getTensorShape(bindingName)) * sizeof(float);
         cudaMalloc(&buffers[i], binding_size);
-        if (engine->bindingIsInput(i))
+        if (engine->getTensorIOMode(bindingName) == TensorIOMode::kINPUT)
         {
-            input_dims.emplace_back(engine->getBindingDimensions(i));
+            input_dims.emplace_back(engine->getTensorShape(bindingName));
         }
         else
         {
-            output_dims.emplace_back(engine->getBindingDimensions(i));
+            output_dims.emplace_back(engine->getTensorShape(bindingName));
         }
     }
     if (input_dims.empty() || output_dims.empty())
@@ -228,8 +264,9 @@ int main(int argc, char* argv[])
 
     // inference
     std::cout << "Inference"<< std::endl;
-    
-    if(context->enqueueV2(buffers.data(), 0, nullptr))
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    if(context->enqueueV3(stream))
         std::cout << "Forward success !" << std::endl;
     else
         std::cout << "Forward Error !" << std::endl;

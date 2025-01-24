@@ -22,16 +22,6 @@ using namespace nvinfer1;
     } while (0)
 
 
-// CUDA error checking macro
-#define CHECK_CUDA(status) \
-    do { \
-        auto ret = (status); \
-        if (ret != cudaSuccess) { \
-            std::cerr << "CUDA error: " << cudaGetErrorString(ret) << std::endl; \
-            throw std::runtime_error("CUDA error"); \
-        } \
-    } while (0)
-
 // Added: CUDA initialization check
 bool initializeCUDA() {
     int device_count;

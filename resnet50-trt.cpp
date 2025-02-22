@@ -8,25 +8,115 @@
 #include <algorithm>
 #include <numeric>
 #include "opencv2/opencv.hpp"
+#include "resnet_preprocessor.cuh"
+
 
 using namespace nvinfer1;
 
-// Added: CUDA error checking macro
-#define CHECK_CUDA(status) \
-    do { \
-        auto ret = (status); \
-        if (ret != cudaSuccess) { \
-            std::cerr << "CUDA error: " << cudaGetErrorString(ret) << std::endl; \
-            throw std::runtime_error("CUDA error"); \
-        } \
-    } while (0)
+class Preprocessor {
+public:
+    virtual float* preprocess(const std::string& image_path, const nvinfer1::Dims& dims) = 0;
+    virtual ~Preprocessor() {}
+};
+class CPUPreprocessor : public Preprocessor {
+public:
+    CPUPreprocessor()
+    {
+        std::cout << "CPU proprocessor" << std::endl;
+    }
+    float* preprocess(const std::string& image_path, const nvinfer1::Dims& dims) override {
+        // Same implementation as preprocessImageCPU above
+        cv::Mat frame = cv::imread(image_path);
+        if (frame.empty()) {
+            std::cerr << "Input image " << image_path << " load failed\n";
+            return nullptr;
+        }
 
+        const auto input_width = dims.d[2];
+        const auto input_height = dims.d[3];
+        const auto channels = dims.d[1];
+        const auto input_size = cv::Size(input_width, input_height);
 
-// Added: CUDA initialization check
+        cv::Mat resized;
+        cv::resize(frame, resized, input_size, 0, 0, cv::INTER_LINEAR);
+
+        cv::Mat flt_image;
+        resized.convertTo(flt_image, CV_32FC3, 1.f / 255.f);
+        cv::subtract(flt_image, cv::Scalar(0.485f, 0.456f, 0.406f), flt_image);
+        cv::divide(flt_image, cv::Scalar(0.229f, 0.224f, 0.225f), flt_image);
+
+        const auto img_byte_size = flt_image.total() * flt_image.elemSize();
+        float* cpu_input = new float[input_width * input_height * channels];
+        std::memcpy(cpu_input, flt_image.data, img_byte_size);
+
+        std::vector<cv::Mat> chw;
+        for (size_t i = 0; i < channels; ++i) {
+            chw.emplace_back(cv::Mat(input_size, CV_32FC1, &(cpu_input[i * input_width * input_height])));
+        }
+        cv::split(flt_image, chw);
+
+        return cpu_input;
+    }
+};
+class GPUPreprocessor : public Preprocessor {
+public:
+    GPUPreprocessor()
+    {
+        std::cout << "GPU Preprocessor" << std::endl;
+    }
+    float* preprocess(const std::string& image_path, const nvinfer1::Dims& dims) {
+        // Read input image
+        cv::Mat frame = cv::imread(image_path);
+        if (frame.empty()) {
+            std::cerr << "Input image " << image_path << " load failed\n";
+            return nullptr;
+        }
+
+        // Ensure image has 3 channels (RGB)
+        if (frame.channels() != 3) {
+            std::cerr << "Input image must be RGB\n";
+            return nullptr;
+        }
+
+        // Create preprocessor instance (static to persist across calls)
+        static resnet_preprocessor preprocessor;
+        static bool initialized = false;
+        if (!initialized) {
+            // For ResNet, use standard dimensions and parameters
+            const int channels = 3;  // RGB channels
+            const float mean[] = {0.485f, 0.456f, 0.406f};
+            const float std[] = {0.229f, 0.224f, 0.225f};
+            // TensorRT dims are typically [N, C, H, W]
+            const int input_width = dims.d[3];  // Width (W)
+            const int input_height = dims.d[2]; // Height (H)
+            if (!preprocessor.initialize(input_width, input_height, channels, mean, std)) {
+                std::cerr << "Failed to initialize preprocessor\n";
+                return nullptr;
+            }
+            initialized = true;
+        }
+
+        // Process image on GPU using host pointer
+        // The preprocessor will handle copying to device memory internally
+        preprocessor.process(
+            frame.data,       // Host pointer to image data
+            frame.cols,       // Source width
+            frame.rows        // Source height
+        );
+
+        return preprocessor.getOutputBuffer();
+    }
+};
+
 bool initializeCUDA() {
     int device_count;
-    CHECK_CUDA(cudaGetDeviceCount(&device_count));
-    
+    cudaError_t error = cudaGetDeviceCount(&device_count);
+
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+        return false;
+    }
+
     if (device_count == 0) {
         std::cerr << "No CUDA devices found!" << std::endl;
         return false;
@@ -35,13 +125,20 @@ bool initializeCUDA() {
     // Print device information
     for (int dev = 0; dev < device_count; ++dev) {
         cudaDeviceProp prop;
-        CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
-        std::cout << "Found CUDA device " << dev << ": " << prop.name 
+        error = cudaGetDeviceProperties(&prop, dev);
+        if (error != cudaSuccess) {
+            std::cerr << "Failed to get device properties: " << cudaGetErrorString(error) << std::endl;
+            return false;
+        }
+        std::cout << "Found CUDA device " << dev << ": " << prop.name
                   << " (Compute capability: " << prop.major << "." << prop.minor << ")" << std::endl;
     }
 
-    // Set to use first device
-    CHECK_CUDA(cudaSetDevice(0));
+    error = cudaSetDevice(0);
+    if (error != cudaSuccess) {
+        std::cerr << "Failed to set CUDA device: " << cudaGetErrorString(error) << std::endl;
+        return false;
+    }
     return true;
 }
 
@@ -49,24 +146,24 @@ bool initializeCUDA() {
 class CudaTimer {
 public:
     CudaTimer() {
-        CHECK_CUDA(cudaEventCreate(&start_));
-        CHECK_CUDA(cudaEventCreate(&stop_));
+        cudaEventCreate(&start_); 
+        cudaEventCreate(&stop_); 
     }
 
     ~CudaTimer() {
-        CHECK_CUDA(cudaEventDestroy(start_));
-        CHECK_CUDA(cudaEventDestroy(stop_));
+        cudaEventDestroy(start_); 
+        cudaEventDestroy(stop_); 
     }
 
     void start() {
-        CHECK_CUDA(cudaEventRecord(start_));
+        cudaEventRecord(start_);
     }
 
     float stop() {
-        CHECK_CUDA(cudaEventRecord(stop_));
-        CHECK_CUDA(cudaEventSynchronize(stop_));
+        cudaEventRecord(stop_); 
+        cudaEventSynchronize(stop_);
         float milliseconds = 0;
-        CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start_, stop_));
+        cudaEventElapsedTime(&milliseconds, start_, stop_);
         return milliseconds;
     }
 
@@ -188,44 +285,6 @@ std::vector<std::string> getClassesNames(const std::string& imagenet_classes) {
     return classes;
 }
 
-// Preprocessing stage ------------------------------------------------------------------------------------------------
-void preprocessImage(const std::string& image_path, float* gpu_input, const nvinfer1::Dims& dims) {
-    // Read input image
-    cv::Mat frame = cv::imread(image_path);
-    if (frame.empty()) {
-        std::cerr << "Input image " << image_path << " load failed\n";
-        return;
-    }
-
-    const auto input_width = dims.d[2];
-    const auto input_height = dims.d[3];
-    const auto channels = dims.d[1];
-    const auto input_size = cv::Size(input_width, input_height);
-
-    // Resize
-    cv::Mat resized;
-    cv::resize(frame, resized, input_size, 0, 0, cv::INTER_NEAREST);
-
-    // Normalize
-    cv::Mat flt_image;
-    resized.convertTo(flt_image, CV_32FC3, 1.f / 255.f);
-    cv::subtract(flt_image, cv::Scalar(0.485f, 0.456f, 0.406f), flt_image, cv::noArray(), -1);
-    cv::divide(flt_image, cv::Scalar(0.229f, 0.224f, 0.225f), flt_image, 1, -1);
-
-    // To tensor
-    const auto img_byte_size = flt_image.total() * flt_image.elemSize();  // Allocate a buffer to hold all image elements.
-    std::vector<float> cpu_input(input_width * input_height * channels);
-    std::memcpy(cpu_input.data(), flt_image.data, img_byte_size);
-
-    std::vector<cv::Mat> chw;
-    for (size_t i = 0; i < channels; ++i) {
-        chw.emplace_back(cv::Mat(input_size, CV_32FC1, &(cpu_input[i * input_width * input_height])));
-    }
-    cv::split(flt_image, chw);
-
-    cudaMemcpy(gpu_input, cpu_input.data(), img_byte_size, cudaMemcpyHostToDevice);
-}
-
 // Post-processing stage ----------------------------------------------------------------------------------------------
 void postprocessResults(float* gpu_output, const nvinfer1::Dims& dims, const std::string& pathToClassesNames) {
     // Get class names
@@ -259,83 +318,141 @@ void postprocessResults(float* gpu_output, const nvinfer1::Dims& dims, const std
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        std::cerr << "usage: " << argv[0] << " ./resnet50-trt path_to_onnx_model/resnet50.onnx path_to_image/turkish_coffee.jpg path_to_classes_names/imagenet_classes.txt \n";
-        return -1;
-    }
-    const std::string model_path(argv[1]);
-    const std::string image_path(argv[2]);
-    const std::string path_to_classes_names(argv[3]);
-
-    // Initialize TensorRT engine and parse ONNX model
-    TRTUniquePtr<nvinfer1::ICudaEngine> engine;
-    TRTUniquePtr<nvinfer1::IExecutionContext> context;
-    parseOnnxModel(model_path, engine, context);
-
-    // Get sizes of input and output and allocate memory
-    std::vector<nvinfer1::Dims> input_dims;
-    std::vector<nvinfer1::Dims> output_dims;
-    std::vector<void*> buffers(engine->getNbIOTensors());
-    std::vector<std::string> layer_names;
-    
-    for (size_t i = 0; i < engine->getNbIOTensors(); ++i) {
-        const auto bindingName = engine->getIOTensorName(i);
-        layer_names.emplace_back(bindingName);
-        const auto binding_size = getSizeByDim(engine->getTensorShape(bindingName)) * sizeof(float);
-        CHECK_CUDA(cudaMalloc(&buffers[i], binding_size));
-        if (engine->getTensorIOMode(bindingName) == TensorIOMode::kINPUT) {
-            input_dims.emplace_back(engine->getTensorShape(bindingName));
-        } else {
-            output_dims.emplace_back(engine->getTensorShape(bindingName));
+    try {
+        if (argc < 4) {
+            std::cerr << "usage: " << argv[0] << " path_to_onnx_model/resnet50.onnx path_to_image/image.jpg path_to_classes_names/imagenet_classes.txt preprocessing_cpu/preprocessing_gpu\n";
+            return -1;
         }
-    }
+        const std::string model_path(argv[1]);
+        const std::string image_path(argv[2]);
+        const std::string path_to_classes_names(argv[3]);
+        const std::string preprocessing_type(argv[4]);
+        bool use_gpu_preprocessing = preprocessing_type == "preprocessing_cpu" ?  false : true; // Toggle between CPU and GPU
 
-    if (input_dims.empty() || output_dims.empty()) {
-        std::cerr << "Expect at least one input and one output for network\n";
+        // Choose the preprocessing strategy
+        Preprocessor* preprocessor;
+        if (use_gpu_preprocessing) {
+            preprocessor = new GPUPreprocessor();
+        } else {
+            preprocessor = new CPUPreprocessor();
+        }
+
+
+        // Initialize CUDA
+        if (!initializeCUDA()) {
+            throw std::runtime_error("CUDA initialization failed");
+        }
+
+        // Initialize TensorRT engine and parse ONNX model
+        TRTUniquePtr<nvinfer1::ICudaEngine> engine;
+        TRTUniquePtr<nvinfer1::IExecutionContext> context;
+        parseOnnxModel(model_path, engine, context);
+
+        // Get sizes of input and output and allocate memory
+        std::vector<nvinfer1::Dims> input_dims;
+        std::vector<nvinfer1::Dims> output_dims;
+        std::vector<void*> buffers(engine->getNbIOTensors());
+        std::vector<std::string> layer_names;
+
+        for (size_t i = 0; i < engine->getNbIOTensors(); ++i) {
+            const auto bindingName = engine->getIOTensorName(i);
+            if (!bindingName) {
+                throw std::runtime_error("Failed to get binding name");
+            }
+
+            layer_names.emplace_back(bindingName);
+            const auto binding_size = getSizeByDim(engine->getTensorShape(bindingName)) * sizeof(float);
+
+            if (engine->getTensorIOMode(bindingName) == TensorIOMode::kINPUT) {
+                input_dims.emplace_back(engine->getTensorShape(bindingName));
+                buffers[i] = nullptr;  // Will be set later with preprocessed_data
+            } else {
+                output_dims.emplace_back(engine->getTensorShape(bindingName));
+                cudaError_t error = cudaMalloc(&buffers[i], binding_size);
+                if (error != cudaSuccess) {
+                    throw std::runtime_error("Failed to allocate CUDA memory: " + std::string(cudaGetErrorString(error)));
+                }
+            }
+        }
+
+        if (input_dims.empty() || output_dims.empty()) {
+            throw std::runtime_error("Expect at least one input and one output for network");
+        }
+
+        // Create CUDA stream
+        cudaStream_t stream;
+        cudaError_t error = cudaStreamCreate(&stream);
+        if (error != cudaSuccess) {
+            throw std::runtime_error("Failed to create CUDA stream: " + std::string(cudaGetErrorString(error)));
+        }
+
+        cv::Mat image = cv::imread(image_path);
+        if (image.empty()) {
+            throw std::runtime_error("Failed to load image: " + image_path);
+        }
+        std::cout << "Image dimensions: " << image.rows << "x" << image.cols << std::endl;
+
+
+        // Create timer and time preprocessing
+        CudaTimer timer;
+        timer.start();
+        float* preprocessed_data = preprocessor->preprocess(image_path, input_dims[0]);
+        if (!preprocessed_data) {
+            std::cerr << "Preprocessing failed\n";
+            delete preprocessor;
+            return 1;
+        }
+
+        if (!preprocessed_data) {
+            throw std::runtime_error("Preprocessing failed");
+        }
+        size_t preprocessed_data_size = getSizeByDim(input_dims[0]) * sizeof(float);
+
+        if (buffers[0] == nullptr) {
+            cudaMalloc(&buffers[0], preprocessed_data_size);
+        }
+        if(use_gpu_preprocessing)
+            cudaMemcpy(buffers[0], preprocessed_data, preprocessed_data_size, cudaMemcpyDeviceToDevice);
+        else
+            cudaMemcpy(buffers[0], preprocessed_data, preprocessed_data_size, cudaMemcpyHostToDevice);    
+
+        float preprocess_time = timer.stop();
+        std::cout << "Preprocessing time: " << preprocess_time << " ms" << std::endl;
+
+        // Time inference
+        timer.start();
+        if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) {
+            throw std::runtime_error("Failed to set input tensor address");
+        }
+        if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) {
+            throw std::runtime_error("Failed to set output tensor address");
+        }
+        if (!context->enqueueV3(stream)) {
+            throw std::runtime_error("Failed to enqueue inference");
+        }
+        float inference_time = timer.stop();
+        std::cout << "Inference time: " << inference_time << " ms" << std::endl;
+
+        // Time postprocessing
+        timer.start();
+        postprocessResults(static_cast<float*>(buffers[1]), output_dims[0], path_to_classes_names);
+        float postprocess_time = timer.stop();
+        std::cout << "Postprocessing time: " << postprocess_time << " ms" << std::endl;
+
+        std::cout << "Total time: " << (preprocess_time + inference_time + postprocess_time) << " ms" << std::endl;
+
+        // Cleanup
+        cudaStreamDestroy(stream);
+        for (auto& buffer : buffers) {
+            if (buffer) {
+                cudaFree(buffer);
+            }
+        }
+
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return -1;
     }
-
-    // Create CUDA stream and timer
-    cudaStream_t stream;
-    CHECK_CUDA(cudaStreamCreate(&stream));
-    CudaTimer timer;
-
-    // Time preprocessing
-    timer.start();
-    preprocessImage(image_path, (float*)buffers[0], input_dims[0]);
-    float preprocess_time = timer.stop();
-    std::cout << "Preprocessing time: " << preprocess_time << " ms" << std::endl;
-
-    // Time inference
-    if (!context->setInputTensorAddress(layer_names[0].c_str(), buffers[0])) {
-        throw std::runtime_error("Failed to set input tensor address");
-    }
-    if (!context->setOutputTensorAddress(layer_names[1].c_str(), buffers[1])) {
-        throw std::runtime_error("Failed to set output tensor address");
-    }
-
-    timer.start();
-    if (!context->enqueueV3(stream)) {
-        throw std::runtime_error("Failed to enqueue inference");
-    }
-    CHECK_CUDA(cudaStreamSynchronize(stream));
-    float inference_time = timer.stop();
-    std::cout << "Inference time: " << inference_time << " ms" << std::endl;
-
-    // Time postprocessing
-    timer.start();
-    postprocessResults(static_cast<float*>(buffers[1]), output_dims[0], path_to_classes_names);
-    float postprocess_time = timer.stop();
-    std::cout << "Postprocessing time: " << postprocess_time << " ms" << std::endl;
-
-    // Print total time
-    std::cout << "Total time: " << (preprocess_time + inference_time + postprocess_time) << " ms" << std::endl;
-
-    // Cleanup
-    CHECK_CUDA(cudaStreamDestroy(stream));
-    for (void* buf : buffers) {
-        CHECK_CUDA(cudaFree(buf));
-    }
-
-    return 0;
 }
